@@ -1,0 +1,126 @@
+name: Build Frappe app images
+
+# Manual only: a rebuild is a deliberate step (new digests have to be tested before the Moza app store uses them).
+on:
+  workflow_dispatch:
+    inputs:
+      apps:
+        description: "Apps to build, comma separated (crm,insights,lms,raven,builder,lending) or all"
+        required: true
+        default: all
+      frappe_branch:
+        description: "Frappe branch the bench is initialised with (and the frappe/base, frappe/build tags)"
+        required: true
+        default: version-16
+      frappe_docker_ref:
+        description: "frappe/frappe_docker commit the layered Containerfile is taken from"
+        required: true
+        default: d6cc2e0d054e69d6c9288134080fa933be564d13
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      apps: ${{ steps.apps.outputs.apps }}
+    steps:
+      - id: apps
+        env:
+          INPUT: ${{ inputs.apps }}
+        run: |
+          all='["crm","insights","lms","raven","builder","lending"]'
+          if [ "$INPUT" = all ]; then
+            echo "apps=$all" >> "$GITHUB_OUTPUT"
+          else
+            list=$(echo "$INPUT" | tr -d ' ' | jq -R -c 'split(",")')
+            # Only known apps: each one has its apps/<app>.json.
+            echo "$list" | jq -e --argjson all "$all" 'all(.[]; . as $a | $all | index($a))' > /dev/null
+            echo "apps=$list" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app: ${{ fromJSON(needs.plan.outputs.apps) }}
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/frappe-${{ matrix.app }}
+    steps:
+      - name: Free disk space for the bench build
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: frappe/frappe_docker
+          ref: ${{ inputs.frappe_docker_ref }}
+          path: builds
+
+      - name: Tags
+        id: meta
+        run: |
+          # The app's own release tag is the last entry of its apps.json.
+          version=$(jq -r '.[-1].branch' "apps/${{ matrix.app }}.json")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tags=$IMAGE:$version-$(date -u +%Y%m%d),$IMAGE:$version" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: builds
+          file: builds/images/layered/Containerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          sbom: false
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            FRAPPE_BRANCH=${{ inputs.frappe_branch }}
+          secret-files: |
+            apps_json=apps/${{ matrix.app }}.json
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=Frappe bench with ${{ matrix.app }} ${{ steps.meta.outputs.version }} (frappe_docker layered build)
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+
+      # frappe_docker once stopped reading the apps list from a build-arg and upstream images shipped Frappe alone:
+      # never trust a build without reading what the bench actually holds.
+      - name: Verify the apps inside the image
+        env:
+          REF: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+        run: |
+          docker pull -q "$REF"
+          docker run --rm --entrypoint cat "$REF" sites/apps.txt | tee apps.txt
+          for url in $(jq -r '.[].url' "apps/${{ matrix.app }}.json"); do
+            name=$(basename "$url" | tr 'A-Z' 'a-z')
+            grep -qx "$name" apps.txt || { echo "::error::$name missing from sites/apps.txt"; exit 1; }
+          done
+          {
+            echo "### frappe-${{ matrix.app }}"
+            echo
+            echo "Pin: \`$REF\`"
+            echo
+            echo "| app | version | commit |"
+            echo "|---|---|---|"
+            docker run --rm --entrypoint cat "$REF" sites/apps.json \
+              | jq -r 'to_entries[] | "| \(.key) | \(.value.version) | \(.value.resolution.commit_hash // "-") |"'
+            echo
+            echo "frappe_docker: \`${{ inputs.frappe_docker_ref }}\`, Frappe branch: \`${{ inputs.frappe_branch }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
